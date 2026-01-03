@@ -640,6 +640,68 @@ export function registerEmailTools(
     );
   }
 
+  // archive emails - convenience tool
+  if (hasAnyWriteAccess) {
+    server.tool(
+      "archive_emails",
+      "Move emails to archive folder. Convenience wrapper for move_emails.",
+      z.object({
+        ...accountParam,
+        ids: z.array(z.string()).min(1).max(100).describe("Email IDs to archive"),
+      }).shape,
+      async (args) => {
+        try {
+          const account = getAccount(accountMap, args.account);
+
+          if (account.isReadOnly) {
+            throw new Error(`account "${account.name}" is read-only`);
+          }
+
+          // find archive mailbox
+          const [mbResult] = await account.jam.api.Mailbox.query({
+            accountId: account.accountId,
+            filter: { role: "archive" },
+          });
+
+          if (!mbResult.ids.length) {
+            throw new Error("archive mailbox not found");
+          }
+
+          const updates: Record<string, EmailCreate> = {};
+          for (const id of args.ids) {
+            updates[id] = { mailboxIds: { [mbResult.ids[0]]: true } };
+          }
+
+          const [result] = await account.jam.api.Email.set({
+            accountId: account.accountId,
+            update: updates,
+          });
+
+          return {
+            content: [
+              {
+                type: "text",
+                text: JSON.stringify({
+                  archived: Object.keys(result.updated || {}).length,
+                  failed: Object.keys(result.notUpdated || {}).length,
+                }),
+              },
+            ],
+          };
+        } catch (error) {
+          return {
+            content: [
+              {
+                type: "text",
+                text: `error: ${formatError(error)}`,
+              },
+            ],
+          };
+        }
+      },
+    );
+  }
+
   // identity listing - works for any account
   server.tool(
     "get_identities",
