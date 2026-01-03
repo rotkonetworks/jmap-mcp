@@ -157,13 +157,23 @@ are extracted from the username portion of the `username:password` format.
 All tools support an optional `account` parameter to specify which account to
 operate on.
 
-1. **Email Search & Retrieval**: `search_emails`, `get_emails`, `get_threads`
-2. **Mailbox Management**: `get_mailboxes`
-3. **Email Actions** (non-read-only): `mark_emails`, `move_emails`,
+1. **Account & Identity**: `list_accounts`, `get_identities`
+2. **Email Search & Retrieval**: `search_emails`, `get_emails`, `get_threads`
+3. **Mailbox Management**: `get_mailboxes`, `get_inbox_summary`
+4. **Email Actions** (non-read-only): `mark_emails`, `move_emails`,
    `delete_emails`
-4. **Email Composition** (submission capability): `send_email`, `reply_to_email`
-5. **Draft Management** (non-read-only): `create_draft`, `update_draft`,
+5. **Email Composition** (submission capability): `send_email`, `reply_to_email`
+6. **Draft Management** (non-read-only): `create_draft`, `update_draft`,
    `send_draft`
+
+### Agent-Optimized Tools
+
+For AI agents, these tools provide efficient context gathering:
+
+- `list_accounts` - discover available accounts and their capabilities
+- `get_identities` - list sender addresses for composing emails
+- `get_inbox_summary` - quick overview with unread count and recent email previews
+- `search_emails` with `fetchDetails=true` - search and get previews in one request
 
 ## Development Guidelines
 

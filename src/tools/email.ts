@@ -65,6 +65,9 @@ export const SearchEmailsSchema = z.object({
   body: z.string().optional().describe(
     "The server MAY exclude MIME body parts with content media types other than text/* and message/* from consideration in search matching. Care should be taken to match based on the text content actually presented to an end user by viewers for that media type or otherwise identified as appropriate for search indexing. Matching document metadata uninteresting to an end user (e.g., markup tag and attribute names) is undesirable.",
   ),
+  fetchDetails: z.boolean().default(false).describe(
+    "If true, fetch email details (from, subject, preview) in the same request. More efficient for getting an overview.",
+  ),
 });
 
 export const GetMailboxesSchema = z.object({
@@ -224,7 +227,7 @@ export function registerEmailTools(
 ) {
   server.tool(
     "search_emails",
-    "Search emails with various filters including text search, sender/recipient filters, date ranges, and keywords. Results are paginated - use position parameter for pagination.",
+    "Search emails with various filters including text search, sender/recipient filters, date ranges, and keywords. Results are paginated - use position parameter for pagination. Use fetchDetails=true to get email previews in one request.",
     SearchEmailsSchema.shape,
     async (args) => {
       try {
@@ -239,6 +242,37 @@ export function registerEmailTools(
           sort: [{ property: "receivedAt", isAscending: false }],
         });
 
+        // optionally fetch email details in the same request
+        let emails: Array<{
+          id: string;
+          from: string;
+          to: string;
+          subject: string;
+          preview: string;
+          receivedAt: string;
+          isRead: boolean;
+          isFlagged: boolean;
+        }> | undefined;
+
+        if (args.fetchDetails && result.ids.length > 0) {
+          const [emailResult] = await jam.api.Email.get({
+            accountId,
+            ids: result.ids,
+            properties: ["id", "from", "to", "subject", "preview", "receivedAt", "keywords"],
+          });
+
+          emails = emailResult.list.map((e) => ({
+            id: e.id,
+            from: e.from?.[0]?.email || "unknown",
+            to: e.to?.map((t) => t.email).join(", ") || "",
+            subject: e.subject || "(no subject)",
+            preview: e.preview || "",
+            receivedAt: e.receivedAt || "",
+            isRead: !!e.keywords?.["$seen"],
+            isFlagged: !!e.keywords?.["$flagged"],
+          }));
+        }
+
         return {
           content: [
             {
@@ -246,10 +280,9 @@ export function registerEmailTools(
               text: JSON.stringify(
                 {
                   ids: result.ids,
+                  emails,
                   total: result.total,
                   position: result.position,
-                  queryState: result.queryState,
-                  canCalculateChanges: result.canCalculateChanges,
                   hasMore:
                     result.position + result.ids.length < (result.total || 0),
                 },
@@ -575,4 +608,172 @@ export function registerEmailTools(
       },
     );
   }
+
+  // identity listing - works for any account
+  server.tool(
+    "get_identities",
+    "List email identities (sender addresses) for an account. Useful for knowing which addresses can be used for sending.",
+    z.object({ ...accountParam }).shape,
+    async (args) => {
+      try {
+        const { jam, accountId } = getAccount(accountMap, args.account);
+
+        // get all identities (omitting ids returns all)
+        const [result] = await jam.api.Identity.get({
+          accountId,
+        });
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  identities: result.list.map((id) => ({
+                    id: id.id,
+                    name: id.name,
+                    email: id.email,
+                    replyTo: id.replyTo,
+                    bcc: id.bcc,
+                    mayDelete: id.mayDelete,
+                  })),
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      } catch (error) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Error getting identities: ${formatError(error)}`,
+            },
+          ],
+        };
+      }
+    },
+  );
+
+  // inbox summary - quick overview for agents
+  server.tool(
+    "get_inbox_summary",
+    "Get a quick summary of inbox status: unread count, total count, and previews of recent unread emails. Efficient for agents to get context.",
+    z.object({
+      ...accountParam,
+      limit: z.number().min(1).max(20).default(5).describe(
+        "Number of recent unread emails to preview (1-20, default: 5)",
+      ),
+    }).shape,
+    async (args) => {
+      try {
+        const { jam, accountId } = getAccount(accountMap, args.account);
+
+        // get inbox mailbox
+        const [mailboxResult] = await jam.api.Mailbox.query({
+          accountId,
+          filter: { role: "inbox" },
+        });
+
+        if (!mailboxResult.ids.length) {
+          throw new Error("inbox mailbox not found");
+        }
+
+        const [mailboxDetails] = await jam.api.Mailbox.get({
+          accountId,
+          ids: mailboxResult.ids,
+        });
+
+        const inbox = mailboxDetails.list[0];
+
+        // get recent unread emails
+        const [unreadResult] = await jam.api.Email.query({
+          accountId,
+          filter: {
+            inMailbox: inbox.id,
+            notKeyword: "$seen",
+          },
+          limit: args.limit,
+          sort: [{ property: "receivedAt", isAscending: false }],
+        });
+
+        // fetch previews for unread
+        let recentUnread: Array<{
+          id: string;
+          from: string;
+          subject: string;
+          preview: string;
+          receivedAt: string;
+        }> = [];
+
+        if (unreadResult.ids.length > 0) {
+          const [emails] = await jam.api.Email.get({
+            accountId,
+            ids: unreadResult.ids,
+            properties: ["id", "from", "subject", "preview", "receivedAt"],
+          });
+
+          recentUnread = emails.list.map((e) => ({
+            id: e.id,
+            from: e.from?.[0]?.email || "unknown",
+            subject: e.subject || "(no subject)",
+            preview: e.preview || "",
+            receivedAt: e.receivedAt || "",
+          }));
+        }
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify(
+                {
+                  mailbox: inbox.name,
+                  totalEmails: inbox.totalEmails,
+                  unreadEmails: inbox.unreadEmails,
+                  recentUnread,
+                },
+                null,
+                2,
+              ),
+            },
+          ],
+        };
+      } catch (error) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `Error getting inbox summary: ${formatError(error)}`,
+            },
+          ],
+        };
+      }
+    },
+  );
+
+  // list accounts - meta tool for agents
+  server.tool(
+    "list_accounts",
+    "List all configured email accounts and their capabilities. Use this first to understand available accounts.",
+    z.object({}).shape,
+    async () => {
+      const accounts = Array.from(accountMap.values()).map((a) => ({
+        name: a.name,
+        isReadOnly: a.isReadOnly,
+        hasSubmission: a.hasSubmission,
+      }));
+
+      return {
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({ accounts }, null, 2),
+          },
+        ],
+      };
+    },
+  );
 }
