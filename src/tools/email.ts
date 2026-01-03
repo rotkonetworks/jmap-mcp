@@ -11,7 +11,24 @@ import type {
 } from "jmap-jam";
 import { formatError } from "../utils.ts";
 
+type AccountInfo = {
+  name: string;
+  jam: JamClient;
+  accountId: string;
+  isReadOnly: boolean;
+  hasSubmission: boolean;
+};
+
+type AccountMap = Map<string, AccountInfo>;
+
+const accountParam = {
+  account: z.string().optional().describe(
+    "Account name to use (defaults to first configured account)",
+  ),
+};
+
 export const SearchEmailsSchema = z.object({
+  ...accountParam,
   query: z.string().optional().describe(
     "Text search query to find in email content",
   ),
@@ -51,6 +68,7 @@ export const SearchEmailsSchema = z.object({
 });
 
 export const GetMailboxesSchema = z.object({
+  ...accountParam,
   parentId: z.string().optional().describe("Parent mailbox ID to filter by"),
   limit: z.number().min(1).max(200).default(100).describe(
     "Maximum number of mailboxes to return",
@@ -61,6 +79,7 @@ export const GetMailboxesSchema = z.object({
 });
 
 export const GetEmailsSchema = z.object({
+  ...accountParam,
   ids: z.array(z.string()).min(1).max(50).describe(
     "Array of email IDs to retrieve",
   ),
@@ -99,12 +118,14 @@ export const GetEmailsSchema = z.object({
 });
 
 export const GetThreadsSchema = z.object({
+  ...accountParam,
   ids: z.array(z.string()).min(1).max(20).describe(
     "Array of thread IDs to retrieve",
   ),
 });
 
 export const MarkEmailsSchema = z.object({
+  ...accountParam,
   ids: z.array(z.string()).min(1).max(100).describe(
     "Array of email IDs to mark",
   ),
@@ -117,6 +138,7 @@ export const MarkEmailsSchema = z.object({
 });
 
 export const MoveEmailsSchema = z.object({
+  ...accountParam,
   ids: z.array(z.string()).min(1).max(100).describe(
     "Array of email IDs to move",
   ),
@@ -124,6 +146,7 @@ export const MoveEmailsSchema = z.object({
 });
 
 export const DeleteEmailsSchema = z.object({
+  ...accountParam,
   ids: z.array(z.string()).min(1).max(100).describe(
     "Array of email IDs to delete",
   ),
@@ -172,11 +195,32 @@ const buildEmailFilter = (args: z.infer<typeof SearchEmailsSchema>) => {
   return Object.keys(filter).length > 0 ? filter : undefined;
 };
 
+const getAccount = (
+  accountMap: AccountMap,
+  requestedAccount?: string,
+): AccountInfo => {
+  if (requestedAccount) {
+    const account = accountMap.get(requestedAccount);
+    if (!account) {
+      const available = Array.from(accountMap.keys()).join(", ");
+      throw new Error(
+        `account "${requestedAccount}" not found. available accounts: ${available}`,
+      );
+    }
+    return account;
+  }
+
+  // default to first account
+  const firstAccount = accountMap.values().next().value;
+  if (!firstAccount) {
+    throw new Error("no accounts configured");
+  }
+  return firstAccount;
+};
+
 export function registerEmailTools(
   server: McpServer,
-  jam: JamClient,
-  accountId: string,
-  isReadOnly: boolean,
+  accountMap: AccountMap,
 ) {
   server.tool(
     "search_emails",
@@ -184,6 +228,7 @@ export function registerEmailTools(
     SearchEmailsSchema.shape,
     async (args) => {
       try {
+        const { jam, accountId } = getAccount(accountMap, args.account);
         const filter = buildEmailFilter(args);
 
         const [result] = await jam.api.Email.query({
@@ -233,6 +278,7 @@ export function registerEmailTools(
     GetMailboxesSchema.shape,
     async (args) => {
       try {
+        const { jam, accountId } = getAccount(accountMap, args.account);
         let filter: FilterCondition<MailboxFilterCondition> | undefined;
         if (args.parentId) {
           filter = { parentId: args.parentId };
@@ -288,6 +334,7 @@ export function registerEmailTools(
     GetEmailsSchema.shape,
     async (args) => {
       try {
+        const { jam, accountId } = getAccount(accountMap, args.account);
         const [result] = await jam.api.Email.get(
           {
             accountId,
@@ -330,6 +377,7 @@ export function registerEmailTools(
     GetThreadsSchema.shape,
     async (args) => {
       try {
+        const { jam, accountId } = getAccount(accountMap, args.account);
         const [result] = await jam.api.Thread.get({
           accountId,
           ids: args.ids,
@@ -363,13 +411,24 @@ export function registerEmailTools(
     },
   );
 
-  if (!isReadOnly) {
+  // check if any account has write access
+  const hasAnyWriteAccess = Array.from(accountMap.values()).some((a) =>
+    !a.isReadOnly
+  );
+
+  if (hasAnyWriteAccess) {
     server.tool(
       "mark_emails",
-      "Mark emails as read/unread or flagged/unflagged. You can update multiple keywords at once.",
+      "Mark emails as read/unread or flagged/unflagged. You can update multiple keywords at once. Note: only works with accounts that have write access.",
       MarkEmailsSchema.shape,
       async (args) => {
         try {
+          const account = getAccount(accountMap, args.account);
+
+          if (account.isReadOnly) {
+            throw new Error(`account "${account.name}" is read-only`);
+          }
+
           const updates: Record<string, EmailCreate> = {};
 
           for (const id of args.ids) {
@@ -385,8 +444,8 @@ export function registerEmailTools(
             updates[id] = { keywords };
           }
 
-          const [result] = await jam.api.Email.set({
-            accountId,
+          const [result] = await account.jam.api.Email.set({
+            accountId: account.accountId,
             update: updates,
           });
 
@@ -420,10 +479,16 @@ export function registerEmailTools(
 
     server.tool(
       "move_emails",
-      "Move emails from their current mailbox to a different mailbox.",
+      "Move emails from their current mailbox to a different mailbox. Note: only works with accounts that have write access.",
       MoveEmailsSchema.shape,
       async (args) => {
         try {
+          const account = getAccount(accountMap, args.account);
+
+          if (account.isReadOnly) {
+            throw new Error(`account "${account.name}" is read-only`);
+          }
+
           const updates: Record<string, EmailCreate> = {};
 
           for (const id of args.ids) {
@@ -432,8 +497,8 @@ export function registerEmailTools(
             };
           }
 
-          const [result] = await jam.api.Email.set({
-            accountId,
+          const [result] = await account.jam.api.Email.set({
+            accountId: account.accountId,
             update: updates,
           });
 
@@ -467,12 +532,18 @@ export function registerEmailTools(
 
     server.tool(
       "delete_emails",
-      "Delete emails permanently. This action cannot be undone.",
+      "Delete emails permanently. This action cannot be undone. Note: only works with accounts that have write access.",
       DeleteEmailsSchema.shape,
       async (args) => {
         try {
-          const [result] = await jam.api.Email.set({
-            accountId,
+          const account = getAccount(accountMap, args.account);
+
+          if (account.isReadOnly) {
+            throw new Error(`account "${account.name}" is read-only`);
+          }
+
+          const [result] = await account.jam.api.Email.set({
+            accountId: account.accountId,
             destroy: args.ids,
           });
 

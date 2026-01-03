@@ -1,14 +1,14 @@
 {
   "name": "@wyattjoh/jmap-mcp",
-  "version": "0.1.1",
+  "version": "0.3.0",
   "license": "MIT",
   "exports": "./src/mod.ts",
   "publish": {
     "include": ["LICENSE", "README.md", "mod.ts", "src/**/*.ts", "deno.json"]
   },
   "tasks": {
-    "start": "deno run --allow-env --allow-net src/mod.ts",
-    "watch": "deno run --allow-env --allow-net --watch src/mod.ts",
+    "start": "deno run --allow-env --allow-net --env src/mod.ts",
+    "watch": "deno run --allow-env --allow-net --env --watch src/mod.ts",
     "hooks:install": "deno run --allow-read=deno.json,.git/hooks/ --allow-write=.git/hooks/ jsr:@hongminhee/deno-task-hooks",
     "hooks:pre-commit": "deno check && deno fmt --check && deno lint",
     "hooks:pre-push": "deno publish --dry-run --allow-dirty"

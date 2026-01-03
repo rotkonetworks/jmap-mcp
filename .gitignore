@@ -1,0 +1,20 @@
+# environment variables
+.env
+
+# deno cache
+.deno/
+
+# editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# test files
+read-latest.ts
+send-direct.ts
+send-test.ts
+src/jam-client-wrapper.ts
+
+# logs
+*.log
