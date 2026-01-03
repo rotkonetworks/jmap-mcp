@@ -651,4 +651,109 @@ export function registerEmailSubmissionTools(
       }
     },
   );
+
+  // Quick reply - simplified for agents
+  server.tool(
+    "quick_reply",
+    "Quick reply to an email with just body text. Simplified version of reply_to_email for faster agent interaction.",
+    z.object({
+      ...accountParam,
+      emailId: z.string().describe("Email ID to reply to"),
+      body: z.string().describe("Reply body text"),
+      replyAll: z.boolean().default(false).describe("Reply to all recipients"),
+    }).shape,
+    async (args) => {
+      try {
+        const account = getAccount(accountMap, args.account);
+
+        if (!account.hasSubmission) {
+          throw new Error(
+            `account "${account.name}" does not support email submission`,
+          );
+        }
+
+        const [originalEmail] = await account.jam.api.Email.get({
+          accountId: account.accountId,
+          ids: [args.emailId],
+          properties: ["id", "subject", "from", "to", "cc", "replyTo", "messageId"],
+        });
+
+        const original = originalEmail.list[0];
+        if (!original) throw new Error("email not found");
+
+        const replyTo = original.replyTo?.length ? original.replyTo : original.from;
+        const to = replyTo || [];
+        let cc: Array<{ name?: string; email: string }> = [];
+
+        if (args.replyAll) {
+          if (original.to) cc = [...cc, ...original.to];
+          if (original.cc) cc = [...cc, ...original.cc];
+        }
+
+        const subject = original.subject?.startsWith("Re: ")
+          ? original.subject
+          : `Re: ${original.subject}`;
+
+        // Get drafts mailbox
+        const [mailboxResult] = await account.jam.api.Mailbox.get({
+          accountId: account.accountId,
+          filter: { role: "drafts" },
+        });
+        const draftsMailbox = mailboxResult.list[0];
+
+        // deno-lint-ignore no-explicit-any
+        const emailData: any = {
+          mailboxIds: draftsMailbox ? { [draftsMailbox.id]: true } : undefined,
+          subject,
+          to,
+          cc: cc.length ? cc : undefined,
+          bodyValues: {
+            text: { value: args.body, isTruncated: false, isEncodingProblem: false },
+          },
+          keywords: { "$draft": true },
+          attachments: [],
+        };
+        if (original.messageId) {
+          emailData.inReplyTo = Array.isArray(original.messageId)
+            ? original.messageId
+            : [original.messageId];
+        }
+
+        const [emailResult] = await account.jam.api.Email.set({
+          accountId: account.accountId,
+          create: { "reply1": emailData },
+        });
+
+        if (!emailResult.created?.reply1) {
+          throw new Error("failed to create reply");
+        }
+
+        const [submissionResult] = await account.jam.api.EmailSubmission.set({
+          accountId: account.accountId,
+          create: { "sub1": { emailId: emailResult.created.reply1.id } },
+        });
+
+        return {
+          content: [
+            {
+              type: "text",
+              text: JSON.stringify({
+                sent: !!submissionResult.created?.sub1,
+                to: to[0]?.email,
+              }),
+            },
+          ],
+        };
+      } catch (error) {
+        return {
+          content: [
+            {
+              type: "text",
+              text: `error: ${formatError(error)}`,
+            },
+          ],
+        };
+      }
+    },
+  );
 }

@@ -118,6 +118,9 @@ export const GetEmailsSchema = z.object({
   )).optional().describe(
     "Specific Email properties to return (default: all).",
   ),
+  fetchBody: z.boolean().default(false).describe(
+    "If true, fetch full text body content. Shortcut for getting bodyValues.",
+  ),
 });
 
 export const GetThreadsSchema = z.object({
@@ -363,18 +366,46 @@ export function registerEmailTools(
 
   server.tool(
     "get_emails",
-    "Get specific emails by their IDs. Returns full email details including headers, body, and attachments.",
+    "Get specific emails by their IDs. Use fetchBody=true to get text content directly.",
     GetEmailsSchema.shape,
     async (args) => {
       try {
         const { jam, accountId } = getAccount(accountMap, args.account);
-        const [result] = await jam.api.Email.get(
-          {
-            accountId,
-            ids: args.ids,
-            properties: args.properties,
-          } satisfies GetEmailArguments,
-        );
+
+        // if fetchBody is true, include body properties
+        let properties = args.properties;
+        let fetchAllBodyValues = false;
+
+        if (args.fetchBody) {
+          properties = properties || ["id", "from", "to", "subject", "receivedAt"];
+          if (!properties.includes("textBody")) properties = [...properties, "textBody"];
+          if (!properties.includes("bodyValues")) properties = [...properties, "bodyValues"];
+          fetchAllBodyValues = true;
+        }
+
+        const [result] = await jam.api.Email.get({
+          accountId,
+          ids: args.ids,
+          properties,
+          fetchAllBodyValues,
+        } as GetEmailArguments);
+
+        // if fetchBody, extract text content for convenience
+        let emails = result.list;
+        if (args.fetchBody) {
+          emails = result.list.map((e) => {
+            const textPart = e.textBody?.[0];
+            const partId = textPart?.partId;
+            const textBody = partId && e.bodyValues
+              ? (e.bodyValues as Record<string, { value: string }>)[partId]?.value
+              : undefined;
+
+            return {
+              ...e,
+              textContent: textBody,
+            };
+          });
+        }
 
         return {
           content: [
@@ -382,7 +413,7 @@ export function registerEmailTools(
               type: "text",
               text: JSON.stringify(
                 {
-                  emails: result.list,
+                  emails,
                   notFound: result.notFound,
                 },
                 null,
