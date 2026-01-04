@@ -18,3 +18,4 @@ src/jam-client-wrapper.ts
 
 # logs
 *.log
+jmapper

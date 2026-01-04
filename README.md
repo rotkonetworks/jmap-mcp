@@ -1,15 +1,114 @@
-# JMAP MCP Server
+# jmap-mcp
 
-[![JSR](https://jsr.io/badges/@wyattjoh/jmap-mcp)](https://jsr.io/@wyattjoh/jmap-mcp)
-[![JSR Score](https://jsr.io/badges/@wyattjoh/jmap-mcp/score)](https://jsr.io/@wyattjoh/jmap-mcp)
-[![JSR Scope](https://jsr.io/badges/@wyattjoh)](https://jsr.io/@wyattjoh)
+jmap email tools - mcp server + cli for ai agents.
 
-A Model Context Protocol (MCP) server that provides tools for interacting with
-JMAP (JSON Meta Application Protocol) email servers. Built with Deno and using
-the [@htunnicliff/jmap-jam](https://jsr.io/@htunnicliff/jmap-jam) client
-library.
+two interfaces:
+- **jmapper** - token-efficient cli for ai agent email interaction
+- **mcp server** - structured mcp tools for chat uis
 
-## Features
+## quick start
+
+### jmapper cli
+
+```bash
+# install deno
+curl -fsSL https://deno.land/install.sh | sh
+
+# install jmapper
+deno install --allow-env --allow-net -n jmapper jsr:@niceyee/jmap-mcp/cli
+
+# or compile standalone binary
+deno compile --allow-env --allow-net -o jmapper jmapper.ts
+
+# set credentials
+export JMAP_SESSION_URL="https://mail.example.com/.well-known/jmap"
+export JMAP_BEARER_TOKEN="user@example.com:password"
+
+# use it
+jmapper inbox
+jmapper -c unread 10
+jmapper read abc123
+```
+
+### multi-account setup
+
+```bash
+# newline-separated accounts
+export JMAP_BEARER_TOKENS="noc@example.com:pass1
+billing@example.com:pass2
+support@example.com:pass3"
+
+# use specific account with -a flag (prefix match works)
+jmapper -a noc inbox
+jmapper -a billing unread
+```
+
+### jmapper commands
+
+```
+jmapper - compact jmap email cli
+
+Commands:
+  inbox [n]           Show inbox summary (default: 5 recent)
+  unread [n]          Show unread emails
+  search <query>      Search emails
+  read <id>           Read email body
+  from <addr> [n]     Emails from address
+  reply <id> <body>   Quick reply
+  send <to> <subj>    Send (reads body from stdin)
+  mark <id> read|flag Mark email
+  ids                 List sender identities
+  accounts            List configured accounts
+
+Options:
+  -a <account>        Use specific account (email or prefix)
+  -c                  Compact output (one line per email)
+```
+
+## mcp server
+
+for claude desktop, cursor, or other mcp clients:
+
+```json
+{
+  "mcpServers": {
+    "email": {
+      "command": "deno",
+      "args": [
+        "run", "--allow-net", "--allow-env",
+        "jsr:@niceyee/jmap-mcp"
+      ],
+      "env": {
+        "JMAP_SESSION_URL": "https://mail.example.com/.well-known/jmap",
+        "JMAP_BEARER_TOKEN": "user@example.com:password"
+      }
+    }
+  }
+}
+```
+
+## compatible mail servers
+
+works with any jmap-compliant server:
+- [stalwart mail server](https://stalw.art/) (recommended, easy selfhost)
+- [cyrus imap](https://www.cyrusimap.org/) 3.0+
+- [fastmail](https://www.fastmail.com/) (commercial)
+- [apache james](https://james.apache.org/)
+
+## why jmapper over mcp?
+
+| aspect | jmapper cli | mcp server |
+|--------|-------------|------------|
+| output | compact text | json wrapped |
+| tokens | ~100 per inbox | ~400 per inbox |
+| latency | faster | more overhead |
+| use case | ai agents, scripts | chat uis |
+
+for ai agents doing email work, jmapper uses ~4x fewer tokens.
+
+---
+
+## mcp server features
 
 ### Email Management Tools
 

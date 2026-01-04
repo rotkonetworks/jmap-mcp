@@ -6,7 +6,7 @@
 
 import JamClient from "jmap-jam";
 
-const HELP = `jmap-cli - compact email interface
+const HELP = `jmapper - compact jmap email cli
 
 Commands:
   inbox [n]           Show inbox summary (default: 5 recent)
@@ -18,19 +18,26 @@ Commands:
   send <to> <subj>    Send (reads body from stdin)
   mark <id> read|flag Mark email
   ids                 List sender identities
+  accounts            List configured accounts
   help                Show this help
 
 Options:
-  -a <account>        Use specific account
+  -a <account>        Use specific account (email or prefix)
   -c                  Compact output (one line per email)
+  -t                  TSV output (tab-separated, for agents)
+
+Environment:
+  JMAP_SESSION_URL    JMAP server URL (required)
+  JMAP_BEARER_TOKEN   Single account: user@example.com:password
+  JMAP_BEARER_TOKENS  Multi-account: one user:pass per line
 
 Examples:
-  jmap-cli inbox
-  jmap-cli unread 10
-  jmap-cli search "invoice"
-  jmap-cli read abc123
-  jmap-cli -c from billing@
-  echo "Thanks!" | jmap-cli send user@example.com "Re: Hello"
+  jmapper inbox
+  jmapper -c unread 10
+  jmapper search "invoice"
+  jmapper read abc123
+  jmapper -a noc@ inbox
+  echo "Thanks!" | jmapper send user@example.com "Re: Hello"
 `;
 
 type Config = {
@@ -54,9 +61,14 @@ const getConfig = (): Config => {
 };
 
 const createClient = async (config: Config, accountName?: string) => {
-  const acct = accountName
-    ? config.accounts.find((a) => a.name === accountName)
-    : config.accounts[0];
+  let acct = config.accounts[0];
+
+  if (accountName) {
+    // Try exact match first, then prefix match
+    acct = config.accounts.find((a) => a.name === accountName) ||
+           config.accounts.find((a) => a.name.startsWith(accountName)) ||
+           undefined as unknown as typeof acct;
+  }
 
   if (!acct) throw new Error(`Account not found: ${accountName}`);
 
@@ -98,19 +110,28 @@ const createClient = async (config: Config, accountName?: string) => {
   return { jam, accountId, name: acct.name };
 };
 
-// Compact email formatter
-const fmtEmail = (e: Record<string, unknown>, compact: boolean): string => {
-  const from = ((e.from as Array<{ email: string }>)?.[0]?.email || "?").substring(0, 25);
-  const subj = ((e.subject as string) || "(no subject)").substring(0, 50);
+type Fmt = "human" | "compact" | "tsv";
+
+// TSV header for email listings
+const TSV_EMAIL_HEADER = "#flags\tid\tdate\tfrom\tsubject";
+
+// Email formatter
+const fmtEmail = (e: Record<string, unknown>, fmt: Fmt): string => {
+  const from = ((e.from as Array<{ email: string }>)?.[0]?.email || "?").substring(0, 40);
+  const subj = ((e.subject as string) || "(no subject)").substring(0, 60);
   const date = ((e.receivedAt as string) || "").substring(0, 10);
-  const read = (e.keywords as Record<string, boolean>)?.["$seen"] ? " " : "*";
-  const flag = (e.keywords as Record<string, boolean>)?.["$flagged"] ? "!" : " ";
+  const read = (e.keywords as Record<string, boolean>)?.["$seen"] ? "" : "*";
+  const flag = (e.keywords as Record<string, boolean>)?.["$flagged"] ? "!" : "";
+  const flags = `${read}${flag}`.padEnd(2);
   const id = (e.id as string).substring(0, 12);
 
-  if (compact) {
-    return `${read}${flag} ${id} ${date} ${from.padEnd(25)} ${subj}`;
+  if (fmt === "tsv") {
+    return `${flags}\t${id}\t${date}\t${from}\t${subj}`;
   }
-  return `${read}${flag} [${id}] ${date}\n   From: ${from}\n   Subj: ${subj}`;
+  if (fmt === "compact") {
+    return `${flags} ${id} ${date} ${from.padEnd(25)} ${subj}`;
+  }
+  return `${flags} [${id}] ${date}\n   From: ${from}\n   Subj: ${subj}`;
 };
 
 const fmtPreview = (e: Record<string, unknown>): string => {
@@ -119,12 +140,17 @@ const fmtPreview = (e: Record<string, unknown>): string => {
 };
 
 // Commands
-const cmdInbox = async (jam: JamClient, accountId: string, limit: number, compact: boolean) => {
+const cmdInbox = async (jam: JamClient, accountId: string, limit: number, fmt: Fmt) => {
   const [mbResult] = await jam.api.Mailbox.query({ accountId, filter: { role: "inbox" } });
   const [mbDetails] = await jam.api.Mailbox.get({ accountId, ids: mbResult.ids });
   const inbox = mbDetails.list[0];
 
-  console.log(`Inbox: ${inbox.unreadEmails}/${inbox.totalEmails} unread\n`);
+  if (fmt === "tsv") {
+    console.log(`#inbox\t${inbox.unreadEmails}\t${inbox.totalEmails}`);
+    console.log(TSV_EMAIL_HEADER);
+  } else {
+    console.log(`Inbox: ${inbox.unreadEmails}/${inbox.totalEmails} unread\n`);
+  }
 
   const [queryResult] = await jam.api.Email.query({
     accountId,
@@ -133,7 +159,7 @@ const cmdInbox = async (jam: JamClient, accountId: string, limit: number, compac
     sort: [{ property: "receivedAt", isAscending: false }],
   });
 
-  if (!queryResult.ids.length) return console.log("(empty)");
+  if (!queryResult.ids.length) return console.log(fmt === "tsv" ? "" : "(empty)");
 
   const [emails] = await jam.api.Email.get({
     accountId,
@@ -142,12 +168,12 @@ const cmdInbox = async (jam: JamClient, accountId: string, limit: number, compac
   });
 
   for (const e of emails.list) {
-    console.log(fmtEmail(e, compact));
-    if (!compact) console.log(fmtPreview(e));
+    console.log(fmtEmail(e, fmt));
+    if (fmt === "human") console.log(fmtPreview(e));
   }
 };
 
-const cmdUnread = async (jam: JamClient, accountId: string, limit: number, compact: boolean) => {
+const cmdUnread = async (jam: JamClient, accountId: string, limit: number, fmt: Fmt) => {
   const [queryResult] = await jam.api.Email.query({
     accountId,
     filter: { notKeyword: "$seen" },
@@ -155,7 +181,7 @@ const cmdUnread = async (jam: JamClient, accountId: string, limit: number, compa
     sort: [{ property: "receivedAt", isAscending: false }],
   });
 
-  if (!queryResult.ids.length) return console.log("No unread emails");
+  if (!queryResult.ids.length) return console.log(fmt === "tsv" ? "" : "No unread emails");
 
   const [emails] = await jam.api.Email.get({
     accountId,
@@ -163,14 +189,19 @@ const cmdUnread = async (jam: JamClient, accountId: string, limit: number, compa
     properties: ["id", "from", "subject", "receivedAt", "keywords", "preview"],
   });
 
-  console.log(`${queryResult.total} unread total\n`);
+  if (fmt === "tsv") {
+    console.log(`#unread\t${queryResult.total}`);
+    console.log(TSV_EMAIL_HEADER);
+  } else {
+    console.log(`${queryResult.total} unread total\n`);
+  }
   for (const e of emails.list) {
-    console.log(fmtEmail(e, compact));
-    if (!compact) console.log(fmtPreview(e));
+    console.log(fmtEmail(e, fmt));
+    if (fmt === "human") console.log(fmtPreview(e));
   }
 };
 
-const cmdSearch = async (jam: JamClient, accountId: string, query: string, limit: number, compact: boolean) => {
+const cmdSearch = async (jam: JamClient, accountId: string, query: string, limit: number, fmt: Fmt) => {
   const [queryResult] = await jam.api.Email.query({
     accountId,
     filter: { text: query },
@@ -178,7 +209,7 @@ const cmdSearch = async (jam: JamClient, accountId: string, query: string, limit
     sort: [{ property: "receivedAt", isAscending: false }],
   });
 
-  if (!queryResult.ids.length) return console.log("No results");
+  if (!queryResult.ids.length) return console.log(fmt === "tsv" ? "" : "No results");
 
   const [emails] = await jam.api.Email.get({
     accountId,
@@ -186,14 +217,19 @@ const cmdSearch = async (jam: JamClient, accountId: string, query: string, limit
     properties: ["id", "from", "subject", "receivedAt", "keywords", "preview"],
   });
 
-  console.log(`${queryResult.total} results\n`);
+  if (fmt === "tsv") {
+    console.log(`#search\t${queryResult.total}\t${query}`);
+    console.log(TSV_EMAIL_HEADER);
+  } else {
+    console.log(`${queryResult.total} results\n`);
+  }
   for (const e of emails.list) {
-    console.log(fmtEmail(e, compact));
-    if (!compact) console.log(fmtPreview(e));
+    console.log(fmtEmail(e, fmt));
+    if (fmt === "human") console.log(fmtPreview(e));
   }
 };
 
-const cmdFrom = async (jam: JamClient, accountId: string, addr: string, limit: number, compact: boolean) => {
+const cmdFrom = async (jam: JamClient, accountId: string, addr: string, limit: number, fmt: Fmt) => {
   const [queryResult] = await jam.api.Email.query({
     accountId,
     filter: { from: addr },
@@ -201,7 +237,7 @@ const cmdFrom = async (jam: JamClient, accountId: string, addr: string, limit: n
     sort: [{ property: "receivedAt", isAscending: false }],
   });
 
-  if (!queryResult.ids.length) return console.log("No results");
+  if (!queryResult.ids.length) return console.log(fmt === "tsv" ? "" : "No results");
 
   const [emails] = await jam.api.Email.get({
     accountId,
@@ -209,10 +245,15 @@ const cmdFrom = async (jam: JamClient, accountId: string, addr: string, limit: n
     properties: ["id", "from", "subject", "receivedAt", "keywords", "preview"],
   });
 
-  console.log(`${queryResult.total} from ${addr}\n`);
+  if (fmt === "tsv") {
+    console.log(`#from\t${queryResult.total}\t${addr}`);
+    console.log(TSV_EMAIL_HEADER);
+  } else {
+    console.log(`${queryResult.total} from ${addr}\n`);
+  }
   for (const e of emails.list) {
-    console.log(fmtEmail(e, compact));
-    if (!compact) console.log(fmtPreview(e));
+    console.log(fmtEmail(e, fmt));
+    if (fmt === "human") console.log(fmtPreview(e));
   }
 };
 
@@ -261,6 +302,13 @@ const cmdIds = async (jam: JamClient, accountId: string) => {
 
   for (const id of result.list) {
     console.log(`${id.id.substring(0, 12).padEnd(12)} ${id.email} ${id.name ? `(${id.name})` : ""}`);
+  }
+};
+
+const cmdAccounts = (config: Config) => {
+  console.log("Configured accounts:\n");
+  for (const acct of config.accounts) {
+    console.log(`  ${acct.name}`);
   }
 };
 
@@ -356,21 +404,23 @@ const cmdSend = async (jam: JamClient, accountId: string, to: string, subject: s
 const main = async () => {
   const args = Deno.args;
 
-  if (args.length === 0 || args[0] === "help" || args[0] === "-h") {
+  if (args.length === 0 || args[0] === "help" || args[0] === "-h" || args[0] === "--help") {
     console.log(HELP);
     return;
   }
 
   // Parse options
   let account: string | undefined;
-  let compact = false;
+  let fmt: Fmt = "human";
   const positional: string[] = [];
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "-a" && args[i + 1]) {
       account = args[++i];
     } else if (args[i] === "-c") {
-      compact = true;
+      fmt = "compact";
+    } else if (args[i] === "-t" || args[i] === "--tsv") {
+      fmt = "tsv";
     } else {
       positional.push(args[i]);
     }
@@ -379,20 +429,27 @@ const main = async () => {
   const [cmd, ...rest] = positional;
 
   const config = getConfig();
+
+  // Handle commands that don't need a connection
+  if (cmd === "accounts") {
+    cmdAccounts(config);
+    return;
+  }
+
   const { jam, accountId } = await createClient(config, account);
 
   switch (cmd) {
     case "inbox":
-      await cmdInbox(jam, accountId, parseInt(rest[0]) || 5, compact);
+      await cmdInbox(jam, accountId, parseInt(rest[0]) || 5, fmt);
       break;
     case "unread":
-      await cmdUnread(jam, accountId, parseInt(rest[0]) || 10, compact);
+      await cmdUnread(jam, accountId, parseInt(rest[0]) || 10, fmt);
       break;
     case "search":
-      await cmdSearch(jam, accountId, rest.join(" "), 20, compact);
+      await cmdSearch(jam, accountId, rest.join(" "), 20, fmt);
       break;
     case "from":
-      await cmdFrom(jam, accountId, rest[0], parseInt(rest[1]) || 10, compact);
+      await cmdFrom(jam, accountId, rest[0], parseInt(rest[1]) || 10, fmt);
       break;
     case "read":
       await cmdRead(jam, accountId, rest[0]);
