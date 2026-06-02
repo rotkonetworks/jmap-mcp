@@ -1,4 +1,4 @@
-#!/usr/bin/env -S deno run --allow-env --allow-net
+#!/usr/bin/env -S deno run --allow-env --allow-net --allow-read --allow-write
 /**
  * Token-efficient CLI for JMAP email
  * Designed for AI agent interaction with minimal output
@@ -13,6 +13,7 @@ Commands:
   unread [n]          Show unread emails
   search <query>      Search emails
   read <id>           Read email body
+  pull <id> [dir]     List or download attachments (default dir: list only)
   from <addr> [n]     Emails from address
   reply <id> <body>   Quick reply
   send <to> <subj>    Send (reads body from stdin)
@@ -23,6 +24,7 @@ Commands:
 
 Options:
   -a <account>        Use specific account (email or prefix)
+  -f <file>           Attach file (repeatable)
   -c                  Compact output (one line per email)
   -t                  TSV output (tab-separated, for agents)
 
@@ -36,6 +38,7 @@ Examples:
   jmapper -c unread 10
   jmapper search "invoice"
   jmapper read abc123
+  jmapper pull abc123 ./invoices
   jmapper -a noc@ inbox
   echo "Thanks!" | jmapper send user@example.com "Re: Hello"
 `;
@@ -80,17 +83,21 @@ const createClient = async (config: Config, accountName?: string) => {
 
     if (url.includes("jmap") || url.includes(new URL(config.sessionUrl).hostname)) {
       const headers = new Headers(init?.headers);
-      if (headers.has("Authorization")) {
-        headers.set("Authorization", `Basic ${btoa(`${username}:${password}`)}`);
-      }
+      headers.set("Authorization", `Basic ${btoa(`${username}:${password}`)}`);
 
       const resp = await originalFetch(input, { ...init, headers });
 
       if (url.includes("session") || url.includes(".well-known/jmap")) {
         try {
           const json = await resp.clone().json();
-          if (json.apiUrl?.includes("http://") && json.apiUrl?.includes(":8080")) {
-            json.apiUrl = json.apiUrl.replace("http://", "https://").replace(":8080", "");
+          let mutated = false;
+          for (const k of ["apiUrl", "downloadUrl", "uploadUrl", "eventSourceUrl"]) {
+            if (json[k]?.includes("http://") && json[k]?.includes(":8080")) {
+              json[k] = json[k].replace("http://", "https://").replace(":8080", "");
+              mutated = true;
+            }
+          }
+          if (mutated) {
             return new Response(JSON.stringify(json), {
               status: resp.status,
               statusText: resp.statusText,
@@ -284,6 +291,51 @@ const cmdRead = async (jam: JamClient, accountId: string, emailId: string) => {
   }
 };
 
+const cmdPull = async (jam: JamClient, accountId: string, sessionUrl: string, emailId: string, outdir?: string) => {
+  const [result] = await jam.api.Email.get({
+    accountId,
+    ids: [emailId],
+    properties: ["id", "subject", "attachments"],
+  });
+
+  if (!result.list.length) return console.log("Email not found");
+  const atts = ((result.list[0].attachments as Array<{ blobId: string; name: string; type: string; size: number }>) || []);
+
+  if (!atts.length) return console.log("No attachments");
+
+  if (!outdir) {
+    console.log(`${atts.length} attachment(s):`);
+    for (const a of atts) {
+      console.log(`  ${a.name}  (${a.type}, ${(a.size / 1024).toFixed(1)}KB)`);
+    }
+    return;
+  }
+
+  // Get downloadUrl template from session (fetch is already auth-proxied)
+  const sessionResp = await fetch(sessionUrl);
+  const session = await sessionResp.json();
+  const downloadUrl = session.downloadUrl as string;
+  if (!downloadUrl) throw new Error("No downloadUrl in session");
+
+  await Deno.mkdir(outdir, { recursive: true });
+  for (const a of atts) {
+    const url = downloadUrl
+      .replace("{accountId}", accountId)
+      .replace("{blobId}", a.blobId)
+      .replace("{name}", encodeURIComponent(a.name))
+      .replace("{type}", encodeURIComponent(a.type));
+    const resp = await fetch(url);
+    if (!resp.ok) {
+      console.error(`Failed ${a.name}: HTTP ${resp.status}`);
+      continue;
+    }
+    const buf = new Uint8Array(await resp.arrayBuffer());
+    const path = `${outdir}/${a.name}`;
+    await Deno.writeFile(path, buf);
+    console.log(`${path}  (${buf.length} bytes)`);
+  }
+};
+
 const cmdMark = async (jam: JamClient, accountId: string, emailId: string, action: string) => {
   const keywords: Record<string, boolean> = {};
 
@@ -312,7 +364,7 @@ const cmdAccounts = (config: Config) => {
   }
 };
 
-const cmdReply = async (jam: JamClient, accountId: string, emailId: string, body: string) => {
+const cmdReply = async (jam: JamClient, accountId: string, emailId: string, body: string, preferEmail?: string) => {
   const [original] = await jam.api.Email.get({
     accountId,
     ids: [emailId],
@@ -325,6 +377,10 @@ const cmdReply = async (jam: JamClient, accountId: string, emailId: string, body
   const replyTo = (orig.replyTo as Array<{ email: string }>)?.[0] || (orig.from as Array<{ email: string }>)?.[0];
   const subject = (orig.subject as string)?.startsWith("Re: ") ? orig.subject : `Re: ${orig.subject}`;
 
+  // Get sender identity — prefer one matching the account email
+  const [idResult] = await jam.api.Identity.get({ accountId });
+  const identity = (preferEmail && idResult.list.find((id: any) => id.email === preferEmail)) || idResult.list[0];
+
   // Get drafts mailbox
   const [mbResult] = await jam.api.Mailbox.query({ accountId, filter: { role: "drafts" } });
   const [mbDetails] = await jam.api.Mailbox.get({ accountId, ids: mbResult.ids });
@@ -333,6 +389,7 @@ const cmdReply = async (jam: JamClient, accountId: string, emailId: string, body
   // deno-lint-ignore no-explicit-any
   const replyData: any = {
     mailboxIds: drafts ? { [drafts.id]: true } : undefined,
+    from: [{ name: identity?.name || "", email: identity?.email }],
     to: [replyTo],
     subject,
     bodyValues: { text: { value: body, isTruncated: false, isEncodingProblem: false } },
@@ -352,13 +409,32 @@ const cmdReply = async (jam: JamClient, accountId: string, emailId: string, body
   // Send it
   await jam.api.EmailSubmission.set({
     accountId,
-    create: { "sub1": { emailId: draftId } },
+    create: { "sub1": { emailId: draftId, identityId: identity?.id } },
   });
 
   console.log(`Replied to ${replyTo.email}`);
 };
 
-const cmdSend = async (jam: JamClient, accountId: string, to: string, subject: string) => {
+const MIME_TYPES: Record<string, string> = {
+  ".pdf": "application/pdf",
+  ".txt": "text/plain",
+  ".csv": "text/csv",
+  ".json": "application/json",
+  ".png": "image/png",
+  ".jpg": "image/jpeg",
+  ".jpeg": "image/jpeg",
+  ".gif": "image/gif",
+  ".zip": "application/zip",
+  ".gz": "application/gzip",
+  ".tar": "application/x-tar",
+  ".py": "text/x-python",
+  ".ts": "text/typescript",
+  ".js": "text/javascript",
+  ".html": "text/html",
+  ".md": "text/markdown",
+};
+
+const cmdSend = async (jam: JamClient, accountId: string, to: string, subject: string, senderName: string, preferEmail?: string, filePaths: string[] = []) => {
   // Read body from stdin
   const decoder = new TextDecoder();
   const chunks: Uint8Array[] = [];
@@ -369,19 +445,42 @@ const cmdSend = async (jam: JamClient, accountId: string, to: string, subject: s
 
   if (!body.trim()) throw new Error("Body is empty (pipe text to stdin)");
 
+  // Get sender identity — prefer one matching the account email
+  const [idResult] = await jam.api.Identity.get({ accountId });
+  const identity = (preferEmail && idResult.list.find((id: any) => id.email === preferEmail)) || idResult.list[0];
+
   // Get drafts mailbox
   const [mbResult] = await jam.api.Mailbox.query({ accountId, filter: { role: "drafts" } });
   const [mbDetails] = await jam.api.Mailbox.get({ accountId, ids: mbResult.ids });
   const drafts = mbDetails.list[0];
 
+  // Upload attachments
+  const uploadedAttachments: Array<{ blobId: string; type: string; name: string; size: number }> = [];
+  for (const filePath of filePaths) {
+    const fileData = await Deno.readFile(filePath);
+    const fileName = filePath.split("/").pop() || filePath;
+    const ext = "." + fileName.split(".").pop()?.toLowerCase();
+    const mimeType = MIME_TYPES[ext] || "application/octet-stream";
+
+    const blobResponse = await jam.uploadBlob(accountId, new Blob([fileData], { type: mimeType }));
+    uploadedAttachments.push({
+      blobId: blobResponse.blobId,
+      type: mimeType,
+      name: fileName,
+      size: fileData.length,
+    });
+    console.log(`Attached: ${fileName} (${(fileData.length / 1024).toFixed(1)}KB)`);
+  }
+
   // deno-lint-ignore no-explicit-any
   const emailData: any = {
     mailboxIds: drafts ? { [drafts.id]: true } : undefined,
+    from: [{ name: senderName || identity?.name || "", email: identity?.email }],
     to: [{ email: to }],
     subject,
     bodyValues: { text: { value: body, isTruncated: false, isEncodingProblem: false } },
     keywords: { "$draft": true },
-    attachments: [],
+    attachments: uploadedAttachments,
   };
 
   const [emailResult] = await jam.api.Email.set({
@@ -394,7 +493,7 @@ const cmdSend = async (jam: JamClient, accountId: string, to: string, subject: s
 
   await jam.api.EmailSubmission.set({
     accountId,
-    create: { "sub1": { emailId: draftId } },
+    create: { "sub1": { emailId: draftId, identityId: identity?.id } },
   });
 
   console.log(`Sent to ${to}`);
@@ -412,11 +511,14 @@ const main = async () => {
   // Parse options
   let account: string | undefined;
   let fmt: Fmt = "human";
+  const attachments: string[] = [];
   const positional: string[] = [];
 
   for (let i = 0; i < args.length; i++) {
     if (args[i] === "-a" && args[i + 1]) {
       account = args[++i];
+    } else if (args[i] === "-f" && args[i + 1]) {
+      attachments.push(args[++i]);
     } else if (args[i] === "-c") {
       fmt = "compact";
     } else if (args[i] === "-t" || args[i] === "--tsv") {
@@ -436,7 +538,7 @@ const main = async () => {
     return;
   }
 
-  const { jam, accountId } = await createClient(config, account);
+  const { jam, accountId, name: acctEmail } = await createClient(config, account);
 
   switch (cmd) {
     case "inbox":
@@ -454,6 +556,9 @@ const main = async () => {
     case "read":
       await cmdRead(jam, accountId, rest[0]);
       break;
+    case "pull":
+      await cmdPull(jam, accountId, config.sessionUrl, rest[0], rest[1]);
+      break;
     case "mark":
       await cmdMark(jam, accountId, rest[0], rest[1]);
       break;
@@ -461,10 +566,10 @@ const main = async () => {
       await cmdIds(jam, accountId);
       break;
     case "reply":
-      await cmdReply(jam, accountId, rest[0], rest.slice(1).join(" "));
+      await cmdReply(jam, accountId, rest[0], rest.slice(1).join(" "), acctEmail);
       break;
     case "send":
-      await cmdSend(jam, accountId, rest[0], rest.slice(1).join(" "));
+      await cmdSend(jam, accountId, rest[0], rest.slice(1).join(" "), "", acctEmail, attachments);
       break;
     default:
       console.error(`Unknown command: ${cmd}`);
