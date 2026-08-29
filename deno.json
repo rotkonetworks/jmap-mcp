@@ -1,10 +1,16 @@
 {
-  "name": "@wyattjoh/jmap-mcp",
-  "version": "0.3.0",
+  "name": "@rotkonetworks/jmapper",
+  "version": "0.4.0",
   "license": "MIT",
   "exports": "./src/mod.ts",
   "publish": {
-    "include": ["LICENSE", "README.md", "mod.ts", "src/**/*.ts", "deno.json"]
+    "include": [
+      "LICENSE",
+      "README.md",
+      "mod.ts",
+      "src/**/*.ts",
+      "deno.json"
+    ]
   },
   "tasks": {
     "start": "deno run --allow-env --allow-net --env src/mod.ts",
@@ -20,6 +26,6 @@
   },
   "repository": {
     "type": "git",
-    "url": "https://github.com/wyattjoh/jmap-mcp.git"
+    "url": "https://github.com/rotkonetworks/jmap-mcp.git"
   }
 }

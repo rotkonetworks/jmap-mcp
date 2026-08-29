@@ -233,7 +233,7 @@ const createServer = async () => {
   );
 
   const server = new McpServer({
-    name: "jmap",
+    name: "jmapper",
     version: deno.version,
     capabilities: {
       tools: {},
