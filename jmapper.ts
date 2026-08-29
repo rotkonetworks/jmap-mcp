@@ -92,8 +92,8 @@ const createClient = async (config: Config, accountName?: string) => {
           const json = await resp.clone().json();
           let mutated = false;
           for (const k of ["apiUrl", "downloadUrl", "uploadUrl", "eventSourceUrl"]) {
-            if (json[k]?.includes("http://") && json[k]?.includes(":8080")) {
-              json[k] = json[k].replace("http://", "https://").replace(":8080", "");
+            if (typeof json[k] === "string" && json[k].startsWith("http://")) {
+              json[k] = json[k].replace(/^http:\/\/([^/:]+)(?::\d+)?/, "https://$1");
               mutated = true;
             }
           }
@@ -364,11 +364,11 @@ const cmdAccounts = (config: Config) => {
   }
 };
 
-const cmdReply = async (jam: JamClient, accountId: string, emailId: string, body: string, preferEmail?: string) => {
+const cmdReply = async (jam: JamClient, accountId: string, emailId: string, body: string, preferEmail?: string, filePaths: string[] = []) => {
   const [original] = await jam.api.Email.get({
     accountId,
     ids: [emailId],
-    properties: ["id", "from", "subject", "replyTo", "messageId"],
+    properties: ["id", "from", "subject", "replyTo", "messageId", "references"],
   });
 
   if (!original.list.length) throw new Error("Email not found");
@@ -381,10 +381,24 @@ const cmdReply = async (jam: JamClient, accountId: string, emailId: string, body
   const [idResult] = await jam.api.Identity.get({ accountId });
   const identity = (preferEmail && idResult.list.find((id: any) => id.email === preferEmail)) || idResult.list[0];
 
-  // Get drafts mailbox
+  // Get drafts + sent mailboxes
   const [mbResult] = await jam.api.Mailbox.query({ accountId, filter: { role: "drafts" } });
   const [mbDetails] = await jam.api.Mailbox.get({ accountId, ids: mbResult.ids });
   const drafts = mbDetails.list[0];
+  const [sentQuery] = await jam.api.Mailbox.query({ accountId, filter: { role: "sent" } });
+  const sentId = sentQuery.ids[0];
+
+  // Upload attachments
+  const uploadedAttachments: Array<{ blobId: string; type: string; name: string; size: number }> = [];
+  for (const filePath of filePaths) {
+    const fileData = await Deno.readFile(filePath);
+    const fileName = filePath.split("/").pop() || filePath;
+    const ext = "." + fileName.split(".").pop()?.toLowerCase();
+    const mimeType = MIME_TYPES[ext] || "application/octet-stream";
+    const blobResponse = await jam.uploadBlob(accountId, new Blob([fileData], { type: mimeType }));
+    uploadedAttachments.push({ blobId: blobResponse.blobId, type: mimeType, name: fileName, size: fileData.length });
+    console.log(`Attached: ${fileName} (${(fileData.length / 1024).toFixed(1)}KB)`);
+  }
 
   // deno-lint-ignore no-explicit-any
   const replyData: any = {
@@ -393,10 +407,12 @@ const cmdReply = async (jam: JamClient, accountId: string, emailId: string, body
     to: [replyTo],
     subject,
     bodyValues: { text: { value: body, isTruncated: false, isEncodingProblem: false } },
+    textBody: [{ partId: "text", type: "text/plain" }],
     keywords: { "$draft": true },
-    attachments: [],
+    attachments: uploadedAttachments,
   };
   if (orig.messageId) replyData.inReplyTo = [orig.messageId];
+  if (orig.messageId) replyData.references = [...((orig.references as string[]) || []), ...(orig.messageId as string[])];
 
   const [emailResult] = await jam.api.Email.set({
     accountId,
@@ -406,13 +422,24 @@ const cmdReply = async (jam: JamClient, accountId: string, emailId: string, body
   const draftId = emailResult.created?.reply1?.id;
   if (!draftId) throw new Error("Failed to create reply");
 
-  // Send it
-  await jam.api.EmailSubmission.set({
+  // Send it, and on success file to Sent (remove $draft, move out of Drafts)
+  const [subResult] = await jam.api.EmailSubmission.set({
     accountId,
     create: { "sub1": { emailId: draftId, identityId: identity?.id } },
+    // JMAP (RFC 8621 §5.3) defines onSuccessUpdateEmail as a PatchObject, whose
+    // keys are slash-separated pointers like "keywords/$draft". jmap-jam types it
+    // as Record<Id, Partial<Email>>, which cannot express those paths, so the cast
+    // is required until the library models PatchObject.
+    onSuccessUpdateEmail: sentId
+      ? ({ "#sub1": { "keywords/$draft": null, [`mailboxIds/${drafts?.id}`]: null, [`mailboxIds/${sentId}`]: true } } as unknown as Record<string, Record<string, unknown>>)
+      : undefined,
   });
 
-  console.log(`Replied to ${replyTo.email}`);
+  if (subResult.notCreated?.sub1) {
+    throw new Error(`Submission failed: ${JSON.stringify(subResult.notCreated.sub1)}`);
+  }
+
+  console.log(`Replied to ${replyTo.email}${sentId ? " (filed to Sent)" : ""}`);
 };
 
 const MIME_TYPES: Record<string, string> = {
@@ -479,6 +506,7 @@ const cmdSend = async (jam: JamClient, accountId: string, to: string, subject: s
     to: [{ email: to }],
     subject,
     bodyValues: { text: { value: body, isTruncated: false, isEncodingProblem: false } },
+    textBody: [{ partId: "text", type: "text/plain" }],
     keywords: { "$draft": true },
     attachments: uploadedAttachments,
   };
@@ -566,7 +594,7 @@ const main = async () => {
       await cmdIds(jam, accountId);
       break;
     case "reply":
-      await cmdReply(jam, accountId, rest[0], rest.slice(1).join(" "), acctEmail);
+      await cmdReply(jam, accountId, rest[0], rest.slice(1).join(" "), acctEmail, attachments);
       break;
     case "send":
       await cmdSend(jam, accountId, rest[0], rest.slice(1).join(" "), "", acctEmail, attachments);

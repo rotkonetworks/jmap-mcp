@@ -10,6 +10,7 @@ import type {
   MailboxFilterCondition,
 } from "jmap-jam";
 import { formatError } from "../utils.ts";
+import { buildDownloadUrl } from "../attachments.ts";
 
 type AccountInfo = {
   name: string;
@@ -867,6 +868,128 @@ export function registerEmailTools(
           },
         ],
       };
+    },
+  );
+  server.tool(
+    "download_attachment",
+    "List or download an email's attachments. Without savePath, returns the attachment list (name, type, size); image attachments are additionally returned as viewable image content. With savePath (a directory), writes the files to disk and returns their paths.",
+    {
+      ...accountParam,
+      emailId: z.string().describe("Email ID whose attachments to fetch"),
+      name: z.string().optional().describe(
+        "Only act on the attachment with this exact filename",
+      ),
+      savePath: z.string().optional().describe(
+        "Directory to write attachments into. Omit to list instead of download.",
+      ),
+    },
+    async (args) => {
+      try {
+        const { jam, accountId } = getAccount(accountMap, args.account);
+        const sessionUrl = Deno.env.get("JMAP_SESSION_URL");
+        if (!sessionUrl) throw new Error("JMAP_SESSION_URL is not set");
+
+        const [result] = await jam.api.Email.get({
+          accountId,
+          ids: [args.emailId],
+          properties: ["id", "subject", "attachments"],
+        });
+        const email = result.list[0];
+        if (!email) throw new Error(`email ${args.emailId} not found`);
+
+        type Att = {
+          blobId: string;
+          name?: string;
+          type: string;
+          size: number;
+        };
+        let atts = (email.attachments ?? []) as unknown as Att[];
+        if (args.name) atts = atts.filter((a) => a.name === args.name);
+
+        if (atts.length === 0) {
+          return {
+            content: [{
+              type: "text" as const,
+              text: args.name
+                ? `No attachment named "${args.name}" on this email.`
+                : "This email has no attachments.",
+            }],
+          };
+        }
+
+        // No savePath: describe them, and inline any images so the model can see them.
+        if (!args.savePath) {
+          const content: Array<Record<string, unknown>> = [{
+            type: "text" as const,
+            text: atts.map((a) =>
+              `${a.name ?? "(unnamed)"}  ${a.type}  ${
+                Math.round(a.size / 1024)
+              }KB  blobId=${a.blobId}`
+            ).join("\n"),
+          }];
+          for (const a of atts) {
+            if (!a.type.startsWith("image/")) continue;
+            const url = await buildDownloadUrl(
+              sessionUrl,
+              accountId,
+              a.blobId,
+              a.name ?? "attachment",
+              a.type,
+            );
+            const resp = await fetch(url);
+            if (!resp.ok) {
+              content.push({
+                type: "text" as const,
+                text:
+                  `(could not inline ${a.name}: HTTP ${resp.status} from blob download)`,
+              });
+              continue;
+            }
+            const buf = new Uint8Array(await resp.arrayBuffer());
+            // Guard context cost; large images are described, not inlined.
+            if (buf.length > 3 * 1024 * 1024) {
+              content.push({
+                type: "text" as const,
+                text:
+                  `(${a.name} is ${Math.round(buf.length / 1024)}KB - too large to inline; use savePath)`,
+              });
+              continue;
+            }
+            const b64 = btoa(String.fromCharCode(...buf));
+            content.push({ type: "image", data: b64, mimeType: a.type });
+          }
+          return { content: content as never };
+        }
+
+        await Deno.mkdir(args.savePath, { recursive: true });
+        const written: string[] = [];
+        for (const a of atts) {
+          const url = await buildDownloadUrl(
+            sessionUrl,
+            accountId,
+            a.blobId,
+            a.name ?? "attachment",
+            a.type,
+          );
+          const resp = await fetch(url);
+          if (!resp.ok) {
+            written.push(`${a.name}: FAILED HTTP ${resp.status}`);
+            continue;
+          }
+          const buf = new Uint8Array(await resp.arrayBuffer());
+          const dest = `${args.savePath}/${a.name ?? a.blobId}`;
+          await Deno.writeFile(dest, buf);
+          written.push(`${dest} (${buf.length} bytes)`);
+        }
+        return {
+          content: [{ type: "text" as const, text: written.join("\n") }],
+        };
+      } catch (error) {
+        return {
+          content: [{ type: "text" as const, text: formatError(error) }],
+          isError: true,
+        };
+      }
     },
   );
 }

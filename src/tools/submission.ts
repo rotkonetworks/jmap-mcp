@@ -4,6 +4,7 @@ import type JamClient from "jmap-jam";
 import type { EmailCreate } from "jmap-jam";
 
 import { formatError } from "../utils.ts";
+import { uploadAttachments } from "../attachments.ts";
 
 type AccountInfo = {
   name: string;
@@ -18,6 +19,13 @@ type AccountMap = Map<string, AccountInfo>;
 const accountParam = {
   account: z.string().optional().describe(
     "Account name to use (defaults to first configured account)",
+  ),
+};
+
+const attachmentsParam = {
+  attachments: z.array(z.string()).optional().describe(
+    "Local file paths to attach. Read from the machine running this server, " +
+      "uploaded as JMAP blobs and referenced by the outgoing message.",
   ),
 };
 
@@ -46,6 +54,7 @@ const getAccount = (
 
 export const SendEmailSchema = z.object({
   ...accountParam,
+  ...attachmentsParam,
   to: z.array(z.object({
     name: z.string().optional().describe("Display name of the recipient"),
     email: z.string().email().describe("Email address of the recipient"),
@@ -66,6 +75,7 @@ export const SendEmailSchema = z.object({
 
 export const ReplyToEmailSchema = z.object({
   ...accountParam,
+  ...attachmentsParam,
   emailId: z.string().describe("Email ID to reply to"),
   replyAll: z.boolean().default(false).describe("Reply to all recipients"),
   subject: z.string().optional().describe(
@@ -78,6 +88,7 @@ export const ReplyToEmailSchema = z.object({
 
 export const CreateDraftSchema = z.object({
   ...accountParam,
+  ...attachmentsParam,
   to: z.array(z.object({
     name: z.string().optional().describe("Display name of the recipient"),
     email: z.string().email().describe("Email address of the recipient"),
@@ -164,6 +175,10 @@ export function registerEmailSubmissionTools(
         });
         const draftsMailbox = mailboxResult.list[0];
 
+        const uploadedAttachments = args.attachments?.length
+          ? await uploadAttachments(account.jam, account.accountId, args.attachments)
+          : [];
+
         const emailData = {
           mailboxIds: draftsMailbox ? { [draftsMailbox.id]: true } : undefined,
           subject: args.subject,
@@ -188,7 +203,11 @@ export function registerEmailSubmissionTools(
               },
             }),
           },
-          attachments: [],
+          // jmap-jam types attachments as EmailBodyPart[], which requires
+          // `headers`. When creating an Email, JMAP (RFC 8621 §4.1.4) only needs
+          // blobId/type/name/size - the server derives the part headers - so the
+          // library's type is stricter than the protocol.
+          attachments: uploadedAttachments as unknown as EmailCreate["attachments"],
         } satisfies EmailCreate;
 
         const [emailResult] = await account.jam.api.Email.set({
@@ -320,6 +339,10 @@ export function registerEmailSubmissionTools(
         });
         const draftsMailbox = mailboxResult.list[0];
 
+        const uploadedAttachments = args.attachments?.length
+          ? await uploadAttachments(account.jam, account.accountId, args.attachments)
+          : [];
+
         const emailData = {
           mailboxIds: draftsMailbox ? { [draftsMailbox.id]: true } : undefined,
           subject: replySubject,
@@ -327,7 +350,11 @@ export function registerEmailSubmissionTools(
           to,
           cc: finalCc,
           keywords: { "$draft": true },
-          attachments: [],
+          // jmap-jam types attachments as EmailBodyPart[], which requires
+          // `headers`. When creating an Email, JMAP (RFC 8621 §4.1.4) only needs
+          // blobId/type/name/size - the server derives the part headers - so the
+          // library's type is stricter than the protocol.
+          attachments: uploadedAttachments as unknown as EmailCreate["attachments"],
           inReplyTo: [original.id],
           references: original.references
             ? (Array.isArray(original.references)
@@ -443,6 +470,10 @@ export function registerEmailSubmissionTools(
         });
         const draftsMailbox = mailboxResult.list[0];
 
+        const uploadedAttachments = args.attachments?.length
+          ? await uploadAttachments(account.jam, account.accountId, args.attachments)
+          : [];
+
         const emailData = {
           mailboxIds: draftsMailbox ? { [draftsMailbox.id]: true } : undefined,
           subject: args.subject,
@@ -467,7 +498,11 @@ export function registerEmailSubmissionTools(
               },
             }),
           },
-          attachments: [],
+          // jmap-jam types attachments as EmailBodyPart[], which requires
+          // `headers`. When creating an Email, JMAP (RFC 8621 §4.1.4) only needs
+          // blobId/type/name/size - the server derives the part headers - so the
+          // library's type is stricter than the protocol.
+          attachments: uploadedAttachments as unknown as EmailCreate["attachments"],
         } satisfies EmailCreate;
 
         const [emailResult] = await account.jam.api.Email.set({
@@ -658,6 +693,7 @@ export function registerEmailSubmissionTools(
     "Quick reply to an email with just body text. Simplified version of reply_to_email for faster agent interaction.",
     z.object({
       ...accountParam,
+      ...attachmentsParam,
       emailId: z.string().describe("Email ID to reply to"),
       body: z.string().describe("Reply body text"),
       replyAll: z.boolean().default(false).describe("Reply to all recipients"),
@@ -702,6 +738,10 @@ export function registerEmailSubmissionTools(
         const draftsMailbox = mailboxResult.list[0];
 
         // deno-lint-ignore no-explicit-any
+        const uploadedAttachments = args.attachments?.length
+          ? await uploadAttachments(account.jam, account.accountId, args.attachments)
+          : [];
+
         const emailData: any = {
           mailboxIds: draftsMailbox ? { [draftsMailbox.id]: true } : undefined,
           subject,
@@ -711,7 +751,11 @@ export function registerEmailSubmissionTools(
             text: { value: args.body, isTruncated: false, isEncodingProblem: false },
           },
           keywords: { "$draft": true },
-          attachments: [],
+          // jmap-jam types attachments as EmailBodyPart[], which requires
+          // `headers`. When creating an Email, JMAP (RFC 8621 §4.1.4) only needs
+          // blobId/type/name/size - the server derives the part headers - so the
+          // library's type is stricter than the protocol.
+          attachments: uploadedAttachments as unknown as EmailCreate["attachments"],
         };
         if (original.messageId) {
           emailData.inReplyTo = Array.isArray(original.messageId)

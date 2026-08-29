@@ -113,11 +113,12 @@ const createJAMClient = (config: z.infer<typeof JMAPConfigSchema>) => {
       ) {
         const headers = new Headers(init?.headers);
 
-        // Replace Bearer with Basic auth
-        if (headers.has("Authorization")) {
-          const basicAuth = btoa(`${username}:${password}`);
-          headers.set("Authorization", `Basic ${basicAuth}`);
-        }
+        // Always set Basic auth for JMAP hosts, not only when an Authorization
+        // header already exists. Blob download/upload go out as plain fetches
+        // with no header of their own, and the old conditional left those
+        // unauthenticated - the server answered 401 and attachments could not
+        // be fetched at all.
+        headers.set("Authorization", `Basic ${btoa(`${username}:${password}`)}`);
 
         const response = await originalFetch(input, { ...init, headers });
 
@@ -126,15 +127,24 @@ const createJAMClient = (config: z.infer<typeof JMAPConfigSchema>) => {
           const clonedResponse = response.clone();
           try {
             const json = await clonedResponse.json();
-            if (
-              json.apiUrl && json.apiUrl.includes("http://") &&
-              json.apiUrl.includes(":8080")
+            // Servers behind a TLS terminator often advertise plain-http
+            // endpoints on an internal port. Rewrite every session URL, not
+            // just apiUrl, and do not assume the port is 8080 - the previous
+            // narrow check silently left downloadUrl/uploadUrl unusable and
+            // broke any request once the internal port changed.
+            let mutated = false;
+            for (
+              const k of ["apiUrl", "downloadUrl", "uploadUrl", "eventSourceUrl"]
             ) {
-              // Replace HTTP with HTTPS and remove port
-              json.apiUrl = json.apiUrl.replace("http://", "https://").replace(
-                ":8080",
-                "",
-              );
+              if (typeof json[k] === "string" && json[k].startsWith("http://")) {
+                json[k] = json[k].replace(
+                  /^http:\/\/([^/:]+)(?::\d+)?/,
+                  "https://$1",
+                );
+                mutated = true;
+              }
+            }
+            if (mutated) {
               return new Response(JSON.stringify(json), {
                 status: response.status,
                 statusText: response.statusText,
